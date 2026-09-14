@@ -63,6 +63,16 @@ class StatusBarController {
     
     private var isToggle = false
 
+    // AppKit does not expose which third-party status items were dropped because
+    // the active application's menus consumed the available width. When the user
+    // opts into the full-menu-bar mode, claim the menu bar before revealing the
+    // hidden items and publish an empty main menu. This gives status items the
+    // widest supported layout without touching another application's menu.
+    private var standardMainMenu: NSMenu?
+    private let expandedMainMenu = NSMenu(title: "Expanded Status Items")
+    private var isUsingFullMenuBar = false
+    private var activationSource: NSRunningApplication?
+
     // SPEC-003 (macOS 27 hide-mechanism). macOS 27 re-architected the menu bar so
     // inflating the separator length may no longer push items off-screen (#360).
     // This is DIAGNOSTIC ONLY: on the first collapse with the menu-bar window
@@ -106,6 +116,7 @@ class StatusBarController {
         restoreRemovedStatusItems()
         setupAlwayHideStatusBar()
         setupHoverToExpandIfEnabled()
+        NotificationCenter.default.addObserver(self, selector: #selector(applicationDidBecomeActive), name: NSApplication.didBecomeActiveNotification, object: NSApp)
         NotificationCenter.default.addObserver(self, selector: #selector(handleScreenParametersChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             self?.collapseMenuBar()
@@ -264,6 +275,7 @@ class StatusBarController {
     
     private func collapseMenuBar() {
         guard self.isBtnSeparateValidPosition && !self.isCollapsed else {
+            restoreApplicationMenuIfNeeded()
             autoCollapseIfNeeded()
             return
         }
@@ -272,25 +284,108 @@ class StatusBarController {
         if let button = btnExpandCollapse.button {
             button.image = Assets.expandImage
         }
-        if Preferences.useFullStatusBarOnExpandEnabled {
-            NSApp.setActivationPolicy(.accessory)
-            NSApp.deactivate()
-        }
+        restoreApplicationMenuIfNeeded()
         verifyHideMechanismIfNeeded()
     }
+
     private func expandMenubar() {
+        guard self.isCollapsed else {return}
+
+        if Preferences.useFullStatusBarOnExpandEnabled {
+            // A status-item mouse-up does not make its accessory app active.
+            // Finish the click first, then request a coordinated activation from
+            // the app that currently owns the menu bar. Reveal only after AppKit
+            // confirms the transfer via didBecomeActiveNotification.
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.isCollapsed else { return }
+                self.prepareFullMenuBarForExpansion()
+                DispatchQueue.main.async { [weak self] in
+                    self?.requestFullMenuBarActivation()
+                }
+            }
+        } else {
+            revealExpandedMenuBar()
+        }
+    }
+
+    private func revealExpandedMenuBar() {
         guard self.isCollapsed else {return}
         btnSeparate.length = btnHiddenLength
         if let button = btnExpandCollapse.button {
             button.image = Assets.collapseImage
         }
         autoCollapseIfNeeded()
-        
-        if Preferences.useFullStatusBarOnExpandEnabled {
-            NSApp.setActivationPolicy(.regular)
-            NSApp.activate(ignoringOtherApps: true)
-            
+    }
+
+    private func prepareFullMenuBarForExpansion() {
+        guard !isUsingFullMenuBar else { return }
+
+        activationSource = NSWorkspace.shared.frontmostApplication
+        standardMainMenu = NSApp.mainMenu
+        NSApp.mainMenu = expandedMainMenu
+        NSApp.setActivationPolicy(.regular)
+        isUsingFullMenuBar = true
+    }
+
+    private func requestFullMenuBarActivation() {
+        guard isUsingFullMenuBar, isCollapsed else { return }
+
+        if NSApp.isActive {
+            revealExpandedMenuBar()
+            return
         }
+
+        let requestAccepted: Bool
+        if #available(macOS 14.0, *),
+           let activationSource = activationSource,
+           activationSource != NSRunningApplication.current {
+            requestAccepted = NSRunningApplication.current.activate(from: activationSource)
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+            requestAccepted = true
+        }
+
+        guard requestAccepted else {
+            fallBackToStandardExpansion()
+            return
+        }
+
+        // Activation is asynchronous and is not guaranteed even when the
+        // request was accepted. Never leave the arrow apparently unresponsive
+        // or the app stuck in regular activation policy if the system declines.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self = self,
+                  self.isUsingFullMenuBar,
+                  self.isCollapsed,
+                  !NSApp.isActive else { return }
+            self.fallBackToStandardExpansion()
+        }
+    }
+
+    private func fallBackToStandardExpansion() {
+        restoreApplicationMenuIfNeeded()
+        if isCollapsed {
+            revealExpandedMenuBar()
+        }
+    }
+
+    @objc private func applicationDidBecomeActive() {
+        if isUsingFullMenuBar && isCollapsed {
+            revealExpandedMenuBar()
+        }
+    }
+
+    private func restoreApplicationMenuIfNeeded() {
+        guard isUsingFullMenuBar else { return }
+
+        if let standardMainMenu = standardMainMenu {
+            NSApp.mainMenu = standardMainMenu
+        }
+        standardMainMenu = nil
+        activationSource = nil
+        NSApp.setActivationPolicy(.accessory)
+        NSApp.deactivate()
+        isUsingFullMenuBar = false
     }
     
     private func autoCollapseIfNeeded() {
